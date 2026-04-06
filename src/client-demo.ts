@@ -2,17 +2,6 @@
  * client-demo.ts — Demonstrates the raw 402 payment flow step-by-step,
  * without the automatic handling in @solana/mpp/client.
  *
- * Useful for understanding what happens under the hood or for building
- * a custom client in a language that doesn't have an MPP library yet.
- *
- * Flow:
- *   Step 1 — Send unauthenticated request → receive 402 challenge
- *   Step 2 — Parse challenge from www-authenticate header
- *   Step 3 — Build + sign Solana transaction
- *   Step 4 — Encode transaction as base64 credential
- *   Step 5 — Resend request with Authorization header
- *   Step 6 — Server verifies on-chain → returns data + receipt
- *
  * Run:
  *   npm run client:demo
  */
@@ -33,6 +22,7 @@ import {
 } from '@solana/web3.js'
 import { getTransferSolInstruction } from '@solana-program/system'
 import { CLIENT_PRIVATE_KEY, API_BASE_URL, RPC_URL } from './config.js'
+import { parseChallenge, encodeCredential, decodeReceipt } from './challenge.js'
 
 if (!CLIENT_PRIVATE_KEY) {
   console.error('CLIENT_PRIVATE_KEY not set in .env')
@@ -55,7 +45,6 @@ console.log('Step 1 — Sending unauthenticated request...')
 const initialResponse = await fetch(endpoint)
 
 if (initialResponse.status !== 402) {
-  // Already paid (cached) or free endpoint
   const body = await initialResponse.json()
   console.log('No payment required:', body)
   process.exit(0)
@@ -63,43 +52,32 @@ if (initialResponse.status !== 402) {
 
 console.log(`  → ${initialResponse.status} Payment Required`)
 
-// ─── Step 2: Parse the www-authenticate challenge ─────────────────────────────
-//
-// Header format (simplified):
-//   www-authenticate: mppx challenge="<base64-encoded-JSON>"
-//
-// The decoded JSON contains: amount, currency, recipient, methodDetails
-// (recentBlockhash, feePayer, network, splits, etc.)
+// ─── Step 2: Parse challenge ──────────────────────────────────────────────────
 
 const authHeader = initialResponse.headers.get('www-authenticate') ?? ''
 console.log('\nStep 2 — Parsing www-authenticate header...')
 console.log(`  Raw: ${authHeader.slice(0, 80)}...`)
 
-const challengeMatch = authHeader.match(/challenge="([^"]+)"/)
-if (!challengeMatch) throw new Error('No challenge in www-authenticate')
-
-const challenge = JSON.parse(
-  Buffer.from(challengeMatch[1]!, 'base64url').toString('utf8'),
-)
+const challenge = parseChallenge(authHeader)
+if (!challenge) throw new Error('No challenge in www-authenticate')
 
 console.log('  Parsed challenge:')
 console.log(JSON.stringify(challenge, null, 4).replace(/^/gm, '    '))
 
-const { amount, currency, recipient, methodDetails } = challenge
+const { amount, recipient, methodDetails } = challenge
 const { recentBlockhash, feePayer: serverPaysFee, feePayerKey } = methodDetails ?? {}
 
-// ─── Step 3: Build + sign Solana transaction ──────────────────────────────────
+// ─── Step 3: Build + sign transaction ────────────────────────────────────────
 
 console.log('\nStep 3 — Building Solana transaction...')
 
-// Fetch a fresh blockhash if the server didn't include one
 const { value: latestBlockhash } = recentBlockhash
   ? { value: { blockhash: recentBlockhash, lastValidBlockHeight: BigInt(0) } }
   : await rpc.getLatestBlockhash().send()
 
 const feePayer = serverPaysFee
-  ? address(feePayerKey) // server sponsors gas
-  : signer.address       // client pays own gas
+  ? address(feePayerKey!)
+  : signer.address
 
 const transferIx = getTransferSolInstruction({
   source: signer.address,
@@ -115,12 +93,7 @@ const tx = await pipe(
 )
 
 const compiledTx = compileTransaction(tx)
-
-// Full sign if client pays fees; partial sign if server pays
-const signedTx = serverPaysFee
-  ? await signTransaction([signer.keyPair], compiledTx) // partial sign
-  : await signTransaction([signer.keyPair], compiledTx)
-
+const signedTx = await signTransaction([signer.keyPair], compiledTx)
 const base64Tx = getBase64EncodedWireTransaction(signedTx)
 
 console.log('  Transaction built and signed.')
@@ -130,17 +103,9 @@ console.log(`  Base64 length: ${base64Tx.length} chars`)
 
 console.log('\nStep 4 — Encoding credential...')
 
-const credential = {
-  payload: {
-    transaction: base64Tx,
-    type: 'transaction',
-  },
-}
-
-const authValue =
-  'mppx credential="' +
-  Buffer.from(JSON.stringify(credential)).toString('base64url') +
-  '"'
+const authValue = encodeCredential({
+  payload: { transaction: base64Tx, type: 'transaction' },
+})
 
 console.log(`  Authorization: ${authValue.slice(0, 60)}...`)
 
@@ -158,9 +123,7 @@ console.log(`\nStep 6 — Server response: ${paidResponse.status}`)
 
 const receiptHeader = paidResponse.headers.get('x-mpp-receipt')
 if (receiptHeader) {
-  const receipt = JSON.parse(
-    Buffer.from(receiptHeader, 'base64url').toString('utf8'),
-  )
+  const receipt = decodeReceipt(receiptHeader)
   console.log('\nPayment Receipt:')
   console.log(JSON.stringify(receipt, null, 4).replace(/^/gm, '  '))
 }
